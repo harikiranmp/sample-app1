@@ -8,10 +8,6 @@ pipeline {
     KUBECONFIG = "/var/lib/jenkins/.kube/config"
   }
 
-  triggers {
-        githubPush()   
-    }
-
   stages {
     stage('Checkout') {
       steps { checkout scm }
