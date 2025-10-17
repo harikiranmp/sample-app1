@@ -49,7 +49,7 @@ pipeline {
                     kubectl apply -f k8s/ingress.yaml
 
                     # Update deployment image to latest build tag
-                    kubectl set image deployment/sample-app-deployment sample-app=$IMAGE_NAME:$TAG --record
+                    kubectl set image deployment/sample-app-deployment sample-app=$IMAGE:$TAG --record
 
                     # Wait for rollout to complete
                     kubectl rollout status deployment/sample-app-deployment
