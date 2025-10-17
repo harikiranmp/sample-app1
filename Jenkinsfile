@@ -5,11 +5,12 @@ pipeline {
     DOCKERHUB_USER = 'harikiranmp'
     IMAGE = "${DOCKERHUB_USER}/sample-app"
     TAG = "build-${env.BUILD_NUMBER}"
+    KUBECONFIG = "/var/lib/jenkins/.kube/config"
   }
 
   triggers {
-    pollSCM('* * * * *') // optional if webhook not yet configured
-  }
+        githubPush()   
+    }
 
   stages {
     stage('Checkout') {
@@ -36,6 +37,26 @@ pipeline {
       }
     }
   }
+
+    stage('Deploy to EKS') {
+            steps {
+                sh '''
+                    echo "Deploying to EKS..."
+
+                    # Apply manifests (for first-time deployment)
+                    kubectl apply -f k8s/deployment.yaml
+                    kubectl apply -f k8s/service.yaml
+                    kubectl apply -f k8s/ingress.yaml
+
+                    # Update deployment image to latest build tag
+                    kubectl set image deployment/sample-app-deployment sample-app=$IMAGE_NAME:$TAG --record
+
+                    # Wait for rollout to complete
+                    kubectl rollout status deployment/sample-app-deployment
+                '''
+            }
+        }
+    }
 
   post {
     success { echo "✅ Image pushed: $IMAGE:$TAG" }
