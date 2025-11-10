@@ -1,39 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJ="aws-eks-ecr-jenkins-demo"
-echo "[+] Creating project: ${PROJ}"
+# === Config (override by exporting before run) ===
+: "${PROJ:=aws-eks-ecr-jenkins-demo}"
+: "${AWS_REGION:=ap-south-1}"
 
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
-write() {
-  local path="$1"; shift
-  mkdir -p "$(dirname "${PROJ}/${path}")"
-  cat > "${PROJ}/${path}" <<'EOF'
-'"$@"'
-EOF
-}
+echo "Creating project: ${PROJ}"
 
-append() {
-  local path="$1"; shift
-  mkdir -p "$(dirname "${PROJ}/${path}")"
-  cat >> "${PROJ}/${path}" <<'EOF'
-'"$@"'
-EOF
-}
+# Directories
+mkdir -p "$PROJ"/terraform/modules/{vpc,eks,ecr}
+mkdir -p "$PROJ"/terraform/env/dev/backend
+mkdir -p "$PROJ"/helm/app-chart/templates
+mkdir -p "$PROJ"/helm/jenkins-chart/templates
+mkdir -p "$PROJ"/jenkins
+mkdir -p "$PROJ"/scripts
+mkdir -p "$PROJ"/app
 
-mkdir -p "${PROJ}"
-mkdir -p "${PROJ}"/{terraform,helm,jenkins,scripts,app}
-mkdir -p "${PROJ}"/helm/app-chart/{templates}
-mkdir -p "${PROJ}"/helm/jenkins
-mkdir -p "${PROJ}"/terraform/env/dev
-
-# ------------------------------------------------------------------------------
-# Terraform (modular: providers/backend/vars + vpc/ecr/iam/eks/outputs)
-# ------------------------------------------------------------------------------
-
-write terraform/providers.tf '
+# ---------------- Terraform root ----------------
+cat > "$PROJ/terraform/providers.tf" <<'EOF'
 terraform {
   required_version = ">= 1.6.0"
   required_providers {
@@ -43,82 +27,146 @@ terraform {
   }
 }
 
-provider "aws" { region = var.aws_region }
+provider "aws" {
+  region = var.aws_region
+}
 
-# These are wired after cluster creation, safe for terraform validate
+# Wired after cluster exists (safe for validate)
 provider "kubernetes" {
-  host                   = try(module.eks_out.cluster_endpoint, null)
-  cluster_ca_certificate = try(base64decode(module.eks_out.cluster_ca), null)
+  host                   = try(module.eks.cluster_endpoint, null)
+  cluster_ca_certificate = try(base64decode(module.eks.cluster_ca), null)
   token                  = try(data.aws_eks_cluster_auth.this.token, null)
 }
 
 provider "helm" {
   kubernetes {
-    host                   = try(module.eks_out.cluster_endpoint, null)
-    cluster_ca_certificate = try(base64decode(module.eks_out.cluster_ca), null)
+    host                   = try(module.eks.cluster_endpoint, null)
+    cluster_ca_certificate = try(base64decode(module.eks.cluster_ca), null)
     token                  = try(data.aws_eks_cluster_auth.this.token, null)
   }
 }
-'
+EOF
 
-write terraform/backend.tf '
-# Default to local backend for restricted environments.
-terraform {
-  backend "local" {
-    path = "env/dev/terraform.tfstate"
-  }
-}
-
-# --- If you want S3 backend, replace the above with:
-# terraform {
-#   backend "s3" {
-#     bucket         = "YOUR-S3-BUCKET-NAME"
-#     key            = "tfstate/demo/eks/terraform.tfstate"
-#     region         = "ap-south-1"
-#     dynamodb_table = "terraform-locks"   # optional if you use state locking
-#     encrypt        = true
-#   }
-# }
-'
-
-write terraform/variables.tf '
+cat > "$PROJ/terraform/variables.tf" <<'EOF'
 variable "project_name"         { type = string, default = "demo" }
 variable "aws_region"           { type = string, default = "ap-south-1" }
+
+# VPC
 variable "vpc_cidr"             { type = string, default = "10.20.0.0/16" }
 variable "public_subnets"       { type = list(string), default = ["10.20.1.0/24","10.20.2.0/24"] }
 variable "private_subnets"      { type = list(string), default = ["10.20.3.0/24","10.20.4.0/24"] }
+
+# ECR
+variable "ecr_repo_name"        { type = string, default = "demo-app" }
+
+# EKS
 variable "eks_version"          { type = string, default = "1.30" }
 variable "node_instance_type"   { type = string, default = "t3.medium" }
 variable "desired_capacity"     { type = number, default = 2 }
-variable "ecr_repo_name"        { type = string, default = "demo-app" }
 
 variable "tags" {
   type = map(string)
   default = { project = "demo-eks-ecr" }
 }
-'
+EOF
 
-write terraform/env/dev/dev.tfvars '
+cat > "$PROJ/terraform/main.tf" <<'EOF'
+data "aws_eks_cluster_auth" "this" {
+  name = module.eks.cluster_name
+}
+
+# Modules
+module "vpc" {
+  source          = "./modules/vpc"
+  project_name    = var.project_name
+  vpc_cidr        = var.vpc_cidr
+  public_subnets  = var.public_subnets
+  private_subnets = var.private_subnets
+  tags            = var.tags
+}
+
+module "ecr" {
+  source       = "./modules/ecr"
+  repo_name    = var.ecr_repo_name
+  tags         = var.tags
+}
+
+module "eks" {
+  source                = "./modules/eks"
+  project_name          = var.project_name
+  eks_version           = var.eks_version
+  node_instance_type    = var.node_instance_type
+  desired_capacity      = var.desired_capacity
+  private_subnet_ids    = module.vpc.private_subnet_ids
+  public_subnet_ids     = module.vpc.public_subnet_ids
+  vpc_id                = module.vpc.vpc_id
+  tags                  = var.tags
+}
+EOF
+
+cat > "$PROJ/terraform/outputs.tf" <<'EOF'
+output "aws_region"                 { value = var.aws_region }
+output "cluster_name"               { value = module.eks.cluster_name }
+output "cluster_endpoint"           { value = module.eks.cluster_endpoint }
+output "cluster_ca"                 { value = module.eks.cluster_ca }
+output "oidc_provider_arn"          { value = module.eks.oidc_provider_arn }
+output "ecr_repository_url"         { value = module.ecr.repository_url }
+output "public_subnet_ids"          { value = module.vpc.public_subnet_ids }
+output "private_subnet_ids"         { value = module.vpc.private_subnet_ids }
+EOF
+
+cat > "$PROJ/terraform/env/dev/dev.tfvars" <<EOF
 project_name       = "demo"
-aws_region         = "ap-south-1"
+aws_region         = "${AWS_REGION}"
 vpc_cidr           = "10.20.0.0/16"
-public_subnets     = ["10.20.1.0/24", "10.20.2.0/24"]
-private_subnets    = ["10.20.3.0/24", "10.20.4.0/24"]
+public_subnets     = ["10.20.1.0/24","10.20.2.0/24"]
+private_subnets    = ["10.20.3.0/24","10.20.4.0/24"]
 eks_version        = "1.30"
 node_instance_type = "t3.medium"
 desired_capacity   = 2
 ecr_repo_name      = "demo-app"
-'
+EOF
 
-write terraform/vpc.tf '
+# Local backend by default
+cat > "$PROJ/terraform/env/dev/backend/backend.tf" <<'EOF'
+terraform {
+  backend "local" {
+    path = "../../.tfstate/dev/terraform.tfstate"
+  }
+}
+EOF
+
+# Example S3 backend (rename to terraform/backend.tf and fill values)
+cat > "$PROJ/terraform/backend-s3.tf.example" <<'EOF'
+terraform {
+  backend "s3" {
+    bucket         = "YOUR-S3-BUCKET-NAME"
+    key            = "tfstates/demo/terraform.tfstate"
+    region         = "ap-south-1"
+    dynamodb_table = "YOUR-DDB-LOCK-TABLE"  # optional, recommended
+    encrypt        = true
+  }
+}
+EOF
+
+# ---------------- Terraform module: VPC ----------------
+cat > "$PROJ/terraform/modules/vpc/variables.tf" <<'EOF'
+variable "project_name"    { type = string }
+variable "vpc_cidr"        { type = string }
+variable "public_subnets"  { type = list(string) }
+variable "private_subnets" { type = list(string) }
+variable "tags"            { type = map(string) }
+EOF
+
+cat > "$PROJ/terraform/modules/vpc/main.tf" <<'EOF'
+data "aws_availability_zones" "az" {}
+
 resource "aws_vpc" "main" {
   cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
   tags = merge(var.tags, { Name = "${var.project_name}-vpc" })
 }
-
-data "aws_availability_zones" "available" {}
 
 resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.main.id
@@ -129,9 +177,12 @@ resource "aws_subnet" "public" {
   for_each = { a = var.public_subnets[0], b = var.public_subnets[1] }
   vpc_id                  = aws_vpc.main.id
   cidr_block              = each.value
-  availability_zone       = data.aws_availability_zones.available.names[lookup({"a":0,"b":1}, each.key)]
+  availability_zone       = data.aws_availability_zones.az.names[lookup({"a":0,"b":1}, each.key)]
   map_public_ip_on_launch = true
-  tags = merge(var.tags, { Name = "${var.project_name}-public-${each.key}", "kubernetes.io/role/elb" = "1" })
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-public-${each.key}"
+    "kubernetes.io/role/elb" = "1"
+  })
 }
 
 resource "aws_route_table" "public" {
@@ -139,7 +190,7 @@ resource "aws_route_table" "public" {
   tags   = merge(var.tags, { Name = "${var.project_name}-public-rt" })
 }
 
-resource "aws_route" "public_internet" {
+resource "aws_route" "public_inet" {
   route_table_id         = aws_route_table.public.id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = aws_internet_gateway.igw.id
@@ -155,8 +206,11 @@ resource "aws_subnet" "private" {
   for_each = { a = var.private_subnets[0], b = var.private_subnets[1] }
   vpc_id            = aws_vpc.main.id
   cidr_block        = each.value
-  availability_zone = data.aws_availability_zones.available.names[lookup({"a":0,"b":1}, each.key)]
-  tags = merge(var.tags, { Name = "${var.project_name}-private-${each.key}", "kubernetes.io/role/internal-elb" = "1" })
+  availability_zone = data.aws_availability_zones.az.names[lookup({"a":0,"b":1}, each.key)]
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-private-${each.key}"
+    "kubernetes.io/role/internal-elb" = "1"
+  })
 }
 
 resource "aws_eip" "nat" { vpc = true tags = merge(var.tags, { Name = "${var.project_name}-nat-eip" }) }
@@ -167,7 +221,10 @@ resource "aws_nat_gateway" "nat" {
   tags          = merge(var.tags, { Name = "${var.project_name}-nat" })
 }
 
-resource "aws_route_table" "private" { vpc_id = aws_vpc.main.id tags = merge(var.tags, { Name = "${var.project_name}-private-rt" }) }
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+  tags   = merge(var.tags, { Name = "${var.project_name}-private-rt" })
+}
 
 resource "aws_route" "private_nat" {
   route_table_id         = aws_route_table.private.id
@@ -180,178 +237,158 @@ resource "aws_route_table_association" "private_assoc" {
   subnet_id      = each.value.id
   route_table_id = aws_route_table.private.id
 }
-'
+EOF
 
-write terraform/ecr.tf '
-resource "aws_ecr_repository" "app" {
-  name                 = var.ecr_repo_name
+cat > "$PROJ/terraform/modules/vpc/outputs.tf" <<'EOF'
+output "vpc_id"            { value = aws_vpc.main.id }
+output "public_subnet_ids" { value = [for s in aws_subnet.public  : s.id] }
+output "private_subnet_ids"{ value = [for s in aws_subnet.private : s.id] }
+EOF
+
+# ---------------- Terraform module: ECR ----------------
+cat > "$PROJ/terraform/modules/ecr/variables.tf" <<'EOF'
+variable "repo_name" { type = string }
+variable "tags"      { type = map(string) }
+EOF
+
+cat > "$PROJ/terraform/modules/ecr/main.tf" <<'EOF'
+resource "aws_ecr_repository" "this" {
+  name                 = var.repo_name
   image_tag_mutability = "MUTABLE"
   image_scanning_configuration { scan_on_push = true }
   tags = var.tags
 }
-'
+EOF
 
-write terraform/iam.tf '
+cat > "$PROJ/terraform/modules/ecr/outputs.tf" <<'EOF'
+output "repository_url" { value = aws_ecr_repository.this.repository_url }
+EOF
+
+# ---------------- Terraform module: EKS ----------------
+cat > "$PROJ/terraform/modules/eks/variables.tf" <<'EOF'
+variable "project_name"       { type = string }
+variable "eks_version"        { type = string }
+variable "node_instance_type" { type = string }
+variable "desired_capacity"   { type = number }
+variable "private_subnet_ids" { type = list(string) }
+variable "public_subnet_ids"  { type = list(string) }
+variable "vpc_id"             { type = string }
+variable "tags"               { type = map(string) }
+EOF
+
+cat > "$PROJ/terraform/modules/eks/main.tf" <<'EOF'
+# IAM
 data "aws_iam_policy_document" "eks_cluster_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals { type = "Service" identifiers = ["eks.amazonaws.com"] }
-  }
+  statement { actions = ["sts:AssumeRole"] principals { type = "Service" identifiers = ["eks.amazonaws.com"] } }
 }
-
-resource "aws_iam_role" "eks_cluster" {
+resource "aws_iam_role" "cluster" {
   name               = "${var.project_name}-eks-cluster-role"
   assume_role_policy = data.aws_iam_policy_document.eks_cluster_assume.json
   tags               = var.tags
 }
-
-resource "aws_iam_role_policy_attachment" "eks_cluster_AmazonEKSClusterPolicy" {
-  role       = aws_iam_role.eks_cluster.name
+resource "aws_iam_role_policy_attachment" "cluster_AmazonEKSClusterPolicy" {
+  role       = aws_iam_role.cluster.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
 }
 
-data "aws_iam_policy_document" "eks_node_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals { type = "Service" identifiers = ["ec2.amazonaws.com"] }
-  }
+data "aws_iam_policy_document" "node_assume" {
+  statement { actions = ["sts:AssumeRole"] principals { type = "Service" identifiers = ["ec2.amazonaws.com"] } }
 }
-
-resource "aws_iam_role" "eks_node" {
+resource "aws_iam_role" "node" {
   name               = "${var.project_name}-eks-node-role"
-  assume_role_policy = data.aws_iam_policy_document.eks_node_assume.json
+  assume_role_policy = data.aws_iam_policy_document.node_assume.json
   tags               = var.tags
 }
-
-resource "aws_iam_role_policy_attachment" "node_AmazonEKSWorkerNodePolicy" {
-  role       = aws_iam_role.eks_node.name
+resource "aws_iam_role_policy_attachment" "node_EKSWorker" {
+  role       = aws_iam_role.node.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
 }
-resource "aws_iam_role_policy_attachment" "node_AmazonEC2ContainerRegistryReadOnly" {
-  role       = aws_iam_role.eks_node.name
+resource "aws_iam_role_policy_attachment" "node_ECRReadOnly" {
+  role       = aws_iam_role.node.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
-resource "aws_iam_role_policy_attachment" "node_AmazonEKS_CNI_Policy" {
-  role       = aws_iam_role.eks_node.name
+resource "aws_iam_role_policy_attachment" "node_CNI" {
+  role       = aws_iam_role.node.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
 }
-'
 
-write terraform/eks.tf '
-resource "aws_security_group" "eks_cluster" {
+# SG for cluster (minimal)
+resource "aws_security_group" "cluster" {
   name        = "${var.project_name}-eks-cluster-sg"
   description = "EKS cluster communication"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = var.vpc_id
   tags        = var.tags
 }
 
+# EKS cluster
 resource "aws_eks_cluster" "this" {
   name     = "${var.project_name}-eks"
-  role_arn = aws_iam_role.eks_cluster.arn
+  role_arn = aws_iam_role.cluster.arn
   version  = var.eks_version
 
   vpc_config {
-    # Control plane is public; nodes run in private subnets.
-    subnet_ids              = concat([for s in aws_subnet.public : s.id], [for s in aws_subnet.private : s.id])
+    subnet_ids              = concat(var.public_subnet_ids, var.private_subnet_ids)
     endpoint_public_access  = true
     endpoint_private_access = false
-    security_group_ids      = [aws_security_group.eks_cluster.id]
+    security_group_ids      = [aws_security_group.cluster.id]
   }
 
-  depends_on = [aws_iam_role_policy_attachment.eks_cluster_AmazonEKSClusterPolicy]
+  depends_on = [aws_iam_role_policy_attachment.cluster_AmazonEKSClusterPolicy]
   tags       = var.tags
 }
 
-resource "aws_eks_node_group" "default" {
-  cluster_name    = aws_eks_cluster.this.name
-  node_group_name = "${var.project_name}-ng"
-  node_role_arn   = aws_iam_role.eks_node.arn
-  subnet_ids      = [for s in aws_subnet.private : s.id]     # nodes in private subnets
-  instance_types  = [var.node_instance_type]
-
-  scaling_config { desired_size = var.desired_capacity min_size = 1 max_size = var.desired_capacity + 1 }
-  update_config  { max_unavailable = 1 }
-
-  depends_on = [
-    aws_iam_role_policy_attachment.node_AmazonEKSWorkerNodePolicy,
-    aws_iam_role_policy_attachment.node_AmazonEC2ContainerRegistryReadOnly,
-    aws_iam_role_policy_attachment.node_AmazonEKS_CNI_Policy,
-  ]
-  tags = var.tags
-}
-
-# OIDC provider for IRSA (future add-ons)
+# OIDC for IRSA
 resource "aws_iam_openid_connect_provider" "oidc" {
   url             = aws_eks_cluster.this.identity[0].oidc[0].issuer
   client_id_list  = ["sts.amazonaws.com"]
   thumbprint_list = ["9e99a48a9960b14926bb7f3b02e22da0afd10df6"]
 }
 
-data "aws_eks_cluster_auth" "this" { name = aws_eks_cluster.this.name }
+# Managed node group (private subnets)
+resource "aws_eks_node_group" "default" {
+  cluster_name    = aws_eks_cluster.this.name
+  node_group_name = "${var.project_name}-ng"
+  node_role_arn   = aws_iam_role.node.arn
+  subnet_ids      = var.private_subnet_ids
+  instance_types  = [var.node_instance_type]
 
-# Simple module to expose clean outputs for providers
-module "eks_out" {
-  source = "./modules/eks-outputs"
-  cluster_name = aws_eks_cluster.this.name
-  cluster_endpoint = aws_eks_cluster.this.endpoint
-  cluster_ca = aws_eks_cluster.this.certificate_authority[0].data
-  oidc_provider_arn = aws_iam_openid_connect_provider.oidc.arn
+  scaling_config { desired_size = var.desired_capacity min_size = 1 max_size = var.desired_capacity + 1 }
+  update_config  { max_unavailable = 1 }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.node_EKSWorker,
+    aws_iam_role_policy_attachment.node_ECRReadOnly,
+    aws_iam_role_policy_attachment.node_CNI,
+  ]
+  tags = var.tags
 }
-'
+EOF
 
-mkdir -p "${PROJ}/terraform/modules/eks-outputs"
-write terraform/modules/eks-outputs/outputs.tf '
-variable "cluster_name" {}
-variable "cluster_endpoint" {}
-variable "cluster_ca" {}
-variable "oidc_provider_arn" {}
+cat > "$PROJ/terraform/modules/eks/outputs.tf" <<'EOF'
+output "cluster_name"     { value = aws_eks_cluster.this.name }
+output "cluster_endpoint" { value = aws_eks_cluster.this.endpoint }
+output "cluster_ca"       { value = aws_eks_cluster.this.certificate_authority[0].data }
+output "oidc_provider_arn"{ value = aws_iam_openid_connect_provider.oidc.arn }
+EOF
 
-output "cluster_name"  { value = var.cluster_name }
-output "cluster_endpoint" { value = var.cluster_endpoint }
-output "cluster_ca"    { value = var.cluster_ca }
-output "oidc_provider_arn" { value = var.oidc_provider_arn }
-'
-
-write terraform/outputs.tf '
-output "aws_region"     { value = var.aws_region }
-output "cluster_name"   { value = module.eks_out.cluster_name }
-output "cluster_endpoint" { value = module.eks_out.cluster_endpoint }
-output "ecr_repository_url" { value = aws_ecr_repository.app.repository_url }
-output "oidc_provider_arn"  { value = module.eks_out.oidc_provider_arn }
-output "cluster_certificate_authority_data" { value = module.eks_out.cluster_ca }
-'
-
-# ------------------------------------------------------------------------------
-# Sample App (Node) + Dockerfile + Helm chart
-# ------------------------------------------------------------------------------
-write app/server.js '
-const http = require("http");
+# ---------------- App (Node) ----------------
+cat > "$PROJ/app/server.js" <<'EOF'
+const http = require('http');
 const port = process.env.PORT || 8080;
-const version = process.env.APP_VERSION || "v0";
-
-const srv = http.createServer((req, res) => {
-  if (req.url === "/healthz") {
-    res.writeHead(200, {"Content-Type":"application/json"});
-    return res.end(JSON.stringify({status:"ok", version}));
-  }
-  res.writeHead(200, {"Content-Type":"text/plain"});
-  res.end(`Hello from demo app ${version}\n`);
+const version = process.env.APP_VERSION || 'v0';
+const srv = http.createServer((req,res)=>{
+  if(req.url==='/healthz'){ res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify({status:'ok',version})); }
+  res.writeHead(200,{'Content-Type':'text/plain'}); res.end(`Hello from demo app ${version}\n`);
 });
-srv.listen(port, () => console.log("Listening on", port));
-'
+srv.listen(port, ()=>console.log(`Listening on :${port}`));
+EOF
 
-write app/package.json '
-{
-  "name": "demo-app",
-  "version": "1.0.0",
-  "main": "server.js",
-  "license": "MIT",
-  "scripts": { "start": "node server.js" },
-  "dependencies": {}
-}
-'
+cat > "$PROJ/app/package.json" <<'EOF'
+{ "name":"demo-app","version":"1.0.0","main":"server.js","license":"MIT",
+  "scripts":{"start":"node server.js"}, "dependencies":{} }
+EOF
 
-write app/Dockerfile '
+cat > "$PROJ/app/Dockerfile" <<'EOF'
 # syntax=docker/dockerfile:1
 FROM node:20-alpine
 WORKDIR /app
@@ -361,42 +398,40 @@ COPY server.js .
 ENV PORT=8080
 EXPOSE 8080
 CMD ["npm","start"]
-'
+EOF
 
-write helm/app-chart/Chart.yaml '
+# ---------------- Helm: app chart ----------------
+cat > "$PROJ/helm/app-chart/Chart.yaml" <<'EOF'
 apiVersion: v2
 name: app-chart
-description: Simple demo app
+description: Simple demo app chart
 type: application
 version: 0.1.0
 appVersion: "1.0.0"
-'
+EOF
 
-write helm/app-chart/values.yaml '
+cat > "$PROJ/helm/app-chart/values.yaml" <<'EOF'
 replicaCount: 2
-
 image:
   repository: CHANGEME_ECR_URL/demo-app
   pullPolicy: IfNotPresent
   tag: "latest"
-
 service:
   type: LoadBalancer
   port: 80
   targetPort: 8080
-
 resources: {}
 nodeSelector: {}
 tolerations: []
 affinity: []
-'
+EOF
 
-write helm/app-chart/templates/_helpers.tpl '
+cat > "$PROJ/helm/app-chart/templates/_helpers.tpl" <<'EOF'
 {{- define "app-chart.name" -}}app{{- end -}}
 {{- define "app-chart.fullname" -}}app{{- end -}}
-'
+EOF
 
-write helm/app-chart/templates/deployment.yaml '
+cat > "$PROJ/helm/app-chart/templates/deployment.yaml" <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -404,34 +439,24 @@ metadata:
   labels: { app: {{ include "app-chart.name" . }} }
 spec:
   replicas: {{ .Values.replicaCount }}
-  selector:
-    matchLabels: { app: {{ include "app-chart.name" . }} }
+  selector: { matchLabels: { app: {{ include "app-chart.name" . }} } }
   strategy:
     type: RollingUpdate
     rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
   template:
-    metadata:
-      labels: { app: {{ include "app-chart.name" . }} }
+    metadata: { labels: { app: {{ include "app-chart.name" . }} } }
     spec:
       containers:
         - name: app
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports: [ { containerPort: 8080 } ]
-          env:
-            - name: APP_VERSION
-              value: "{{ .Values.image.tag }}"
-          readinessProbe:
-            httpGet: { path: /healthz, port: 8080 }
-            initialDelaySeconds: 3
-            periodSeconds: 5
-          livenessProbe:
-            httpGet: { path: /healthz, port: 8080 }
-            initialDelaySeconds: 5
-            periodSeconds: 10
-'
+          env: [ { name: APP_VERSION, value: "{{ .Values.image.tag }}" } ]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, initialDelaySeconds: 3, periodSeconds: 5 }
+          livenessProbe:  { httpGet: { path: /healthz, port: 8080 }, initialDelaySeconds: 5, periodSeconds: 10 }
+EOF
 
-write helm/app-chart/templates/service.yaml '
+cat > "$PROJ/helm/app-chart/templates/service.yaml" <<'EOF'
 apiVersion: v1
 kind: Service
 metadata:
@@ -443,44 +468,144 @@ spec:
   ports:
     - port: {{ .Values.service.port }}
       targetPort: {{ .Values.service.targetPort }}
-'
+EOF
 
-# ------------------------------------------------------------------------------
-# Jenkins via Helm (separate chart values)
-#  - Uses the official jenkinsci/jenkins chart
-#  - Service: LoadBalancer for quick access in practice env
-# ------------------------------------------------------------------------------
-write helm/jenkins/values.yaml '
-controller:
-  installPlugins:
-    - kubernetes:4269.v1d05e5f52ca_d
-    - workflow-aggregator:596.v8c21c963d92d
-    - git:5.3.0
-    - email-ext:2.104
-    - mailer:489.vd4b_7b_a_42b_85a_
-  adminUser: admin
-  adminPassword: admin123   # change later
-  jenkinsUriPrefix: ""
-  jenkinsUrl: ""
-  JCasC:
-    defaultConfig: true
-  serviceType: LoadBalancer
-  resources:
-    requests: { cpu: "200m", memory: "512Mi" }
-    limits:   { cpu: "1",    memory: "2Gi" }
+# ---------------- Helm: jenkins chart (lightweight) ----------------
+cat > "$PROJ/helm/jenkins-chart/Chart.yaml" <<'EOF'
+apiVersion: v2
+name: jenkins-chart
+description: Minimal Jenkins on EKS (demo)
+type: application
+version: 0.1.0
+appVersion: "lts"
+EOF
 
-agent:
-  enabled: true
+cat > "$PROJ/helm/jenkins-chart/values.yaml" <<'EOF'
+image:
+  repository: jenkins/jenkins
+  tag: lts-jdk17
+  pullPolicy: IfNotPresent
 
-persistence:
-  enabled: true
-  size: 8Gi
-'
+service:
+  type: LoadBalancer
+  port: 8080
+  agentListenerPort: 50000
 
-# ------------------------------------------------------------------------------
-# Jenkins Pipeline (email notifications via Email Extension)
-# ------------------------------------------------------------------------------
-write jenkins/Jenkinsfile '
+adminUser: admin
+adminPassword: admin
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: []
+EOF
+
+cat > "$PROJ/helm/jenkins-chart/templates/deployment.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jenkins
+  labels: { app: jenkins }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: jenkins } }
+  template:
+    metadata: { labels: { app: jenkins } }
+    spec:
+      securityContext: { fsGroup: 1000, runAsUser: 1000 }
+      containers:
+        - name: jenkins
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+            - containerPort: 50000
+          env:
+            - name: JENKINS_OPTS
+              value: "--prefix=/"
+            - name: JAVA_OPTS
+              value: "-Djenkins.install.runSetupWizard=false"
+            - name: JENKINS_ADMIN_ID
+              value: "{{ .Values.adminUser }}"
+            - name: JENKINS_ADMIN_PASSWORD
+              value: "{{ .Values.adminPassword }}"
+          readinessProbe:
+            httpGet: { path: /login, port: 8080 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /login, port: 8080 }
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          volumeMounts:
+            - name: jenkins-home
+              mountPath: /var/jenkins_home
+      volumes:
+        - name: jenkins-home
+          emptyDir: {}   # swap to PVC in real setups
+EOF
+
+cat > "$PROJ/helm/jenkins-chart/templates/service.yaml" <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins
+  labels: { app: jenkins }
+spec:
+  type: {{ .Values.service.type }}
+  selector: { app: jenkins }
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: 8080
+    - name: agent
+      port: {{ .Values.service.agentListenerPort }}
+      targetPort: 50000
+EOF
+
+# ---------------- Scripts ----------------
+cat > "$PROJ/scripts/ecr-login.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+AWS_REGION="${AWS_REGION:-ap-south-1}"
+aws ecr get-login-password --region "${AWS_REGION}" \
+ | docker login --username AWS --password-stdin \
+   "$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
+EOF
+
+cat > "$PROJ/scripts/validate.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+APP_NS="${APP_NS:-default}"
+APP_NAME="${APP_NAME:-app}"
+TIMEOUT="${TIMEOUT:-180}"
+kubectl rollout status deploy/${APP_NAME} -n ${APP_NS} --timeout=${TIMEOUT}s
+TYPE=$(kubectl get svc ${APP_NAME} -n ${APP_NS} -o jsonpath='{.spec.type}')
+if echo "$TYPE" | grep -qi LoadBalancer; then
+  for i in {1..30}; do
+    EP=$(kubectl get svc ${APP_NAME} -n ${APP_NS} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')
+    [[ -n "$EP" ]] && break; echo "Waiting ELB... ($i/30)"; sleep 5
+  done
+  curl -sf "http://${EP}/healthz"
+fi
+echo "[validate] OK"
+EOF
+
+cat > "$PROJ/scripts/rollback.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+APP_NS="${APP_NS:-default}"
+APP_NAME="${APP_NAME:-app}"
+REVISION="${REVISION:-0}"
+echo "[rollback] helm rollback ${APP_NAME} ${REVISION} -n ${APP_NS}"
+helm rollback ${APP_NAME} ${REVISION} -n ${APP_NS} --wait
+kubectl rollout status deploy/${APP_NAME} -n ${APP_NS} --timeout=180s
+EOF
+
+chmod +x "$PROJ"/scripts/*.sh
+
+# ---------------- Jenkinsfile ----------------
+cat > "$PROJ/jenkins/Jenkinsfile" <<'EOF'
 pipeline {
   agent any
   options { timestamps() }
@@ -490,25 +615,27 @@ pipeline {
     ECR_REPO   = "demo-app"
     APP_NAME   = "app"
     APP_NS     = "default"
+    SLACK_WEBHOOK_URL = ""        // leave empty if not used
+    EMAIL_TO = ""                 // set recipients if using email-ext plugin
   }
 
   stages {
-    stage("Checkout") { steps { checkout scm } }
+    stage('Checkout') { steps { checkout scm } }
 
-    stage("Terraform Apply (idempotent)") {
+    stage('Terraform Apply (once)') {
       steps {
-        sh """
+        sh '''
           set -e
           cd terraform
           terraform init -input=false
           terraform apply -input=false -auto-approve -var-file=env/dev/dev.tfvars
-        """
+        '''
       }
     }
 
-    stage("ECR Login") { steps { sh "scripts/ecr-login.sh" } }
+    stage('ECR Login') { steps { sh 'scripts/ecr-login.sh' } }
 
-    stage("Build & Push Image") {
+    stage('Build & Push Image') {
       steps {
         script {
           def commit = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
@@ -516,8 +643,8 @@ pipeline {
           sh """
             set -e
             ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
-            REGISTRY="\${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-            IMAGE="\${REGISTRY}/${ECR_REPO}:${tag}"
+            REGISTRY="\${ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+            IMAGE="\${REGISTRY}/${env.ECR_REPO}:${tag}"
             docker build -t "\${IMAGE}" ./app
             docker push "\${IMAGE}"
             echo "\${IMAGE}" > image.txt
@@ -526,116 +653,92 @@ pipeline {
       }
     }
 
-    stage("Deploy (Helm --atomic)") {
+    stage('Deploy (Helm --atomic)') {
       steps {
-        sh """
+        sh '''
           set -e
-          CLUSTER_NAME=\$(terraform -chdir=terraform output -raw cluster_name)
-          aws eks update-kubeconfig --name "\${CLUSTER_NAME}" --region "${AWS_REGION}"
-
-          IMAGE=\$(cat image.txt)
-          REPO=\$(echo "\$IMAGE" | awk -F: '{print $1}')
-          TAG=\$(echo  "\$IMAGE" | awk -F: '{print $2}')
+          CLUSTER_NAME=$(terraform -chdir=terraform output -raw cluster_name)
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "${AWS_REGION}"
+          IMAGE=$(cat image.txt)
+          REPO=$(echo "$IMAGE" | awk -F: '{print $1}')
+          TAG=$(echo "$IMAGE" | awk -F: '{print $2}')
           mkdir -p helm/app-chart/generated
-          sed "s#CHANGEME_ECR_URL/demo-app#\${REPO%:*}#g" helm/app-chart/values.yaml > helm/app-chart/generated/values.yaml
-
+          sed "s#CHANGEME_ECR_URL/demo-app#${REPO%:*}#g" helm/app-chart/values.yaml > helm/app-chart/generated/values.yaml
           if command -v yq >/dev/null; then
             yq -i ".image.tag = \\"${TAG}\\"" helm/app-chart/generated/values.yaml
           else
             sed -i "s#tag:.*#tag: \\"${TAG}\\"#g" helm/app-chart/generated/values.yaml
           fi
-
-          helm upgrade --install ${APP_NAME} helm/app-chart \
-            -n ${APP_NS} --create-namespace \
-            -f helm/app-chart/generated/values.yaml \
-            --atomic --wait --timeout 5m
-        """
+          helm upgrade --install ${APP_NAME} helm/app-chart -n ${APP_NS} --create-namespace -f helm/app-chart/generated/values.yaml --atomic --wait --timeout 5m
+        '''
       }
     }
 
-    stage("Post-Deploy Validation") { steps { sh "scripts/validate.sh" } }
+    stage('Post-Deploy Validation') { steps { sh 'scripts/validate.sh' } }
   }
 
   post {
     success {
-      emailext(
-        to: "you@example.com",
-        subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER}",
-        body: "Deployment succeeded. Job: ${JOB_NAME} #${BUILD_NUMBER}"
-      )
+      sh '''
+        if [ -n "${SLACK_WEBHOOK_URL}" ]; then
+          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"✅ Success: ${JOB_NAME} #${BUILD_NUMBER}\"}" "${SLACK_WEBHOOK_URL}"
+        fi
+      '''
+      // Uncomment if you have Email Extension plugin configured:
+      // emailext subject: "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+      //          to: "${EMAIL_TO}", body: "Build succeeded."
     }
     failure {
-      script { sh "scripts/rollback.sh || true" }
-      emailext(
-        to: "you@example.com",
-        subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER}",
-        body: "Deployment failed. Rollback attempted. Check Jenkins logs."
-      )
+      sh '''
+        echo "Deployment failed; attempting rollback..."
+        scripts/rollback.sh || true
+        if [ -n "${SLACK_WEBHOOK_URL}" ]; then
+          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"❌ Failed: ${JOB_NAME} #${BUILD_NUMBER} (rollback attempted)\"}" "${SLACK_WEBHOOK_URL}"
+        fi
+      '''
+      // Uncomment if you have Email Extension plugin configured:
+      // emailext subject: "FAILURE: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+      //          to: "${EMAIL_TO}", body: "Build failed. Rollback attempted."
     }
   }
 }
-'
+EOF
 
-# ------------------------------------------------------------------------------
-# Utility scripts
-# ------------------------------------------------------------------------------
-write scripts/ecr-login.sh '
-#!/usr/bin/env bash
-set -euo pipefail
-AWS_REGION="${AWS_REGION:-ap-south-1}"
-aws ecr get-login-password --region "${AWS_REGION}" \
-  | docker login --username AWS --password-stdin \
-    "$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
-'
-write scripts/validate.sh '
-#!/usr/bin/env bash
-set -euo pipefail
-APP_NS="${APP_NS:-default}"
-APP_NAME="${APP_NAME:-app}"
-TIMEOUT="${TIMEOUT:-180}"
-echo "[validate] rollout status..."
-kubectl rollout status deploy/${APP_NAME} -n ${APP_NS} --timeout=${TIMEOUT}s
-TYPE=$(kubectl get svc ${APP_NAME} -n ${APP_NS} -o jsonpath="{.spec.type}")
-if echo "$TYPE" | grep -qi LoadBalancer; then
-  for i in {1..30}; do
-    EP=$(kubectl get svc ${APP_NAME} -n ${APP_NS} -o jsonpath="{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}")
-    [[ -n "$EP" ]] && break
-    echo "Waiting for ELB... ($i/30)"; sleep 5
-  done
-  curl -sf "http://${EP}/healthz"
-fi
-echo "[validate] OK"
-'
-write scripts/rollback.sh '
-#!/usr/bin/env bash
-set -euo pipefail
-APP_NS="${APP_NS:-default}"
-APP_NAME="${APP_NAME:-app}"
-REVISION="${REVISION:-0}"
-echo "[rollback] helm rollback ${APP_NAME} ${REVISION} -n ${APP_NS}"
-helm rollback ${APP_NAME} ${REVISION} -n ${APP_NS} --wait
-kubectl rollout status deploy/${APP_NAME} -n ${APP_NS} --timeout=180s
-echo "[rollback] done"
-'
-chmod +x "${PROJ}"/scripts/*.sh
+# ---------------- README quick run ----------------
+cat > "$PROJ/README.md" <<EOF
+# Fast EKS/ECR CI/CD (Terraform + Jenkins-in-EKS + Helm)
 
-# ------------------------------------------------------------------------------
-# README (quick steps + Jenkins-on-EKS notes)
-# ------------------------------------------------------------------------------
-write README.md '
-# AWS EKS + ECR CI/CD (Terraform + Helm + Jenkins)
-
-## What gets created
-- **VPC** (public & private subnets; NAT)
-- **ECR** repo (`demo-app`)
-- **EKS** 1.30: control plane public; **nodes in private subnets**
-- **App Helm chart** (LB service, probes, atomic rollback)
-- **Jenkins via Helm** (official chart), service = LoadBalancer
-- **Jenkins pipeline**: Terraform → build&push → Helm deploy → validate → email
-
-## 1) Provision infra
-```bash
+## 0) Terraform infra
 cd terraform
 terraform init
 terraform apply -auto-approve -var-file=env/dev/dev.tfvars
-aws eks update-kubeconfig --region ap-south-1 --name $(terraform output -raw cluster_name)
+aws eks update-kubeconfig --region ${AWS_REGION} --name \$(terraform output -raw cluster_name)
+
+## 1) Patch app Helm values
+ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
+ECR_URL="\${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+sed -i "s#CHANGEME_ECR_URL#\${ECR_URL}#g" helm/app-chart/values.yaml
+
+## 2) Deploy Jenkins to EKS
+helm upgrade --install jenkins helm/jenkins-chart -n jenkins --create-namespace
+
+# Get Jenkins LB endpoint:
+kubectl get svc jenkins -n jenkins -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}'
+
+# Default creds (change in values.yaml):
+#   user: admin
+#   pass: admin
+
+## 3) Manual app smoke (optional)
+./scripts/ecr-login.sh
+IMAGE="\${ECR_URL}/demo-app:manual"
+docker build -t "\$IMAGE" ./app && docker push "\$IMAGE"
+helm upgrade --install app helm/app-chart -n default --create-namespace \
+  --set image.repository="\${ECR_URL}/demo-app" --set image.tag="manual" \
+  --atomic --wait
+./scripts/validate.sh
+EOF
+
+echo "✅ Project scaffold created at: ${PROJ}"
+echo "Next:"
+echo "  cd ${PROJ}/terraform && terraform init && terraform apply -auto-approve -var-file=env/dev/dev.tfvars"
