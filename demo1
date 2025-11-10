@@ -1,0 +1,551 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="aws-eks-ecr-jenkins-demo"
+mkdir -p "$ROOT"
+cd "$ROOT"
+
+echo "Creating project at: $(pwd)"
+############################################
+# DIRECTORY STRUCTURE
+############################################
+mkdir -p terraform/modules/eks-outputs
+mkdir -p terraform/env/dev/backend
+mkdir -p jenkins
+mkdir -p helm/app-chart/templates
+mkdir -p app
+mkdir -p scripts
+
+############################################
+# TERRAFORM FILES
+############################################
+
+cat > terraform/providers.tf <<'EOF'
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 5.0" }
+    kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.29" }
+    helm = { source = "hashicorp/helm", version = "~> 2.13" }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+provider "kubernetes" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  token                  = data.aws_eks_cluster_auth.this.token
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+    token                  = data.aws_eks_cluster_auth.this.token
+  }
+}
+EOF
+
+cat > terraform/variables.tf <<'EOF'
+variable "project_name" { default = "demo" }
+variable "aws_region"   { default = "ap-south-1" }
+
+variable "vpc_cidr"        { default = "10.20.0.0/16" }
+variable "public_subnets"  { default = ["10.20.1.0/24", "10.20.2.0/24"] }
+variable "private_subnets" { default = ["10.20.3.0/24", "10.20.4.0/24"] }
+
+variable "eks_version"        { default = "1.30" }
+variable "node_instance_type" { default = "t3.medium" }
+variable "desired_capacity"   { default = 2 }
+
+variable "ecr_repo_name" { default = "demo-app" }
+
+variable "tags" {
+  type = map(string)
+  default = { project = "demo-eks-ecr" }
+}
+EOF
+
+cat > terraform/data_auth.tf <<'EOF'
+data "aws_eks_cluster_auth" "this" {
+  name = module.eks.cluster_name
+}
+
+data "aws_caller_identity" "current" {}
+EOF
+
+############### ✅ SINGLE COMBINED main.tf (NO DUPLICATES!) ################
+cat > terraform/main.tf <<'EOF'
+####################################
+# VPC + SUBNETS + ROUTES
+####################################
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags = merge(var.tags, { Name = "${var.project_name}-vpc" })
+}
+
+data "aws_availability_zones" "available" {}
+
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_subnet" "public" {
+  for_each = { a = var.public_subnets[0], b = var.public_subnets[1] }
+  vpc_id = aws_vpc.main.id
+  cidr_block = each.value
+  availability_zone = data.aws_availability_zones.available.names[lookup({"a":0,"b":1}, each.key)]
+  map_public_ip_on_launch = true
+  tags = {
+    Name = "${var.project_name}-public-${each.key}"
+    "kubernetes.io/role/elb" = "1"
+  }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+}
+resource "aws_route" "public_default" {
+  route_table_id = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id = aws_internet_gateway.igw.id
+}
+resource "aws_route_table_association" "public_assoc" {
+  for_each = aws_subnet.public
+  subnet_id = each.value.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_subnet" "private" {
+  for_each = { a = var.private_subnets[0], b = var.private_subnets[1] }
+  vpc_id = aws_vpc.main.id
+  cidr_block = each.value
+  availability_zone = data.aws_availability_zones.available.names[lookup({"a":0,"b":1}, each.key)]
+  tags = {
+    Name = "${var.project_name}-private-${each.key}"
+    "kubernetes.io/role/internal-elb" = "1"
+  }
+}
+
+resource "aws_eip" "nat" {
+  vpc = true
+}
+
+resource "aws_nat_gateway" "nat" {
+  allocation_id = aws_eip.nat.id
+  subnet_id = values(aws_subnet.public)[0].id
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+}
+resource "aws_route" "private_default" {
+  route_table_id = aws_route_table.private.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id = aws_nat_gateway.nat.id
+}
+resource "aws_route_table_association" "private_assoc" {
+  for_each = aws_subnet.private
+  subnet_id = each.value.id
+  route_table_id = aws_route_table.private.id
+}
+
+####################################
+# ECR
+####################################
+resource "aws_ecr_repository" "app" {
+  name = var.ecr_repo_name
+  image_scanning_configuration { scan_on_push = true }
+}
+
+####################################
+# IAM ROLES FOR EKS
+####################################
+data "aws_iam_policy_document" "eks_cluster_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals { type = "Service", identifiers = ["eks.amazonaws.com"] }
+  }
+}
+
+resource "aws_iam_role" "eks_cluster" {
+  assume_role_policy = data.aws_iam_policy_document.eks_cluster_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "cluster_policy" {
+  role = aws_iam_role.eks_cluster.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
+
+data "aws_iam_policy_document" "node_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals { type = "Service", identifiers = ["ec2.amazonaws.com"] }
+  }
+}
+
+resource "aws_iam_role" "eks_node" {
+  assume_role_policy = data.aws_iam_policy_document.node_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "node_worker" {
+  role = aws_iam_role.eks_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
+resource "aws_iam_role_policy_attachment" "node_ecr" {
+  role = aws_iam_role.eks_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+resource "aws_iam_role_policy_attachment" "node_cni" {
+  role = aws_iam_role.eks_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
+
+####################################
+# EKS Cluster
+####################################
+resource "aws_security_group" "eks_cluster" {
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_eks_cluster" "this" {
+  name = "${var.project_name}-eks"
+  role_arn = aws_iam_role.eks_cluster.arn
+  version = var.eks_version
+
+  vpc_config {
+    subnet_ids = concat(
+      [for s in aws_subnet.public : s.id],
+      [for s in aws_subnet.private : s.id]
+    )
+    endpoint_public_access = true
+  }
+}
+
+resource "aws_eks_node_group" "default" {
+  cluster_name = aws_eks_cluster.this.name
+  node_group_name = "${var.project_name}-ng"
+  node_role_arn = aws_iam_role.eks_node.arn
+  subnet_ids = [for s in aws_subnet.private : s.id]
+
+  scaling_config {
+    desired_size = var.desired_capacity
+    max_size = var.desired_capacity + 1
+    min_size = 1
+  }
+
+  instance_types = [var.node_instance_type]
+}
+
+####################################
+# IRSA OIDC
+####################################
+resource "aws_iam_openid_connect_provider" "oidc" {
+  url = aws_eks_cluster.this.identity[0].oidc[0].issuer
+  client_id_list = ["sts.amazonaws.com"]
+  thumbprint_list = ["9e99a48a9960b14926bb7f3b02e22da0afd10df6"]
+}
+
+####################################
+# OUTPUTS MODULE
+####################################
+module "eks" {
+  source = "./modules/eks-outputs"
+
+  cluster_name = aws_eks_cluster.this.name
+  cluster_endpoint = aws_eks_cluster.this.endpoint
+  cluster_certificate_authority_data = aws_eks_cluster.this.certificate_authority[0].data
+  oidc_provider_arn = aws_iam_openid_connect_provider.oidc.arn
+}
+EOF
+
+############### outputs module ###############
+cat > terraform/modules/eks-outputs/outputs.tf <<'EOF'
+variable "cluster_name" {}
+variable "cluster_endpoint" {}
+variable "cluster_certificate_authority_data" {}
+variable "oidc_provider_arn" {}
+
+output "cluster_name" { value = var.cluster_name }
+output "cluster_endpoint" { value = var.cluster_endpoint }
+output "cluster_certificate_authority_data" { value = var.cluster_certificate_authority_data }
+output "oidc_provider_arn" { value = var.oidc_provider_arn }
+EOF
+
+cat > terraform/env/dev/backend/backend.tf <<'EOF'
+terraform {
+  backend "local" {
+    path = "../../.tfstate/dev/terraform.tfstate"
+  }
+}
+EOF
+
+cat > terraform/env/dev/dev.tfvars <<'EOF'
+project_name       = "demo"
+aws_region         = "ap-south-1"
+vpc_cidr           = "10.20.0.0/16"
+public_subnets     = ["10.20.1.0/24", "10.20.2.0/24"]
+private_subnets    = ["10.20.3.0/24", "10.20.4.0/24"]
+eks_version        = "1.30"
+node_instance_type = "t3.medium"
+desired_capacity   = 2
+ecr_repo_name      = "demo-app"
+EOF
+
+############################################
+# APP
+############################################
+
+cat > app/server.js <<'EOF'
+const http = require('http');
+const port = process.env.PORT || 8080;
+const version = process.env.APP_VERSION || 'v0';
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/healthz') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ status: 'ok', version }));
+  }
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end(`Hello version ${version}\n`);
+});
+
+server.listen(port, () => console.log(`Running on ${port}`));
+EOF
+
+cat > app/package.json <<'EOF'
+{
+  "name": "demo-app",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {}
+}
+EOF
+
+cat > app/Dockerfile <<'EOF'
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json .
+RUN npm install --only=production || true
+COPY server.js .
+EXPOSE 8080
+CMD ["npm","start"]
+EOF
+
+############################################
+# HELM CHART
+############################################
+
+cat > helm/app-chart/Chart.yaml <<'EOF'
+apiVersion: v2
+name: app-chart
+version: 0.1.0
+description: Demo app chart
+type: application
+appVersion: "1.0.0"
+EOF
+
+cat > helm/app-chart/values.yaml <<'EOF'
+replicaCount: 2
+image:
+  repository: CHANGEME_ECR_URL/demo-app
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+service:
+  type: LoadBalancer
+  port: 80
+  targetPort: 8080
+EOF
+
+cat > helm/app-chart/templates/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels: { app: app }
+  template:
+    metadata:
+      labels: { app: app }
+    spec:
+      containers:
+      - name: app
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        ports:
+        - containerPort: 8080
+        livenessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+        readinessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+EOF
+
+cat > helm/app-chart/templates/service.yaml <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: app
+spec:
+  selector: { app: app }
+  type: {{ .Values.service.type }}
+  ports:
+  - port: {{ .Values.service.port }}
+    targetPort: {{ .Values.service.targetPort }}
+EOF
+
+############################################
+# SCRIPTS
+############################################
+
+cat > scripts/ecr-login.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+AWS_REGION="${AWS_REGION:-ap-south-1}"
+aws ecr get-login-password --region "$AWS_REGION" \
+ | docker login --username AWS --password-stdin "$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com"
+EOF
+
+cat > scripts/validate.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+APP_NS="${APP_NS:-default}"
+APP_NAME="${APP_NAME:-app}"
+kubectl rollout status deploy/$APP_NAME -n $APP_NS --timeout=180s
+EOF
+
+cat > scripts/rollback.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+APP_NS="${APP_NS:-default}"
+APP_NAME="${APP_NAME:-app}"
+helm rollback $APP_NAME 0 -n $APP_NS --wait
+kubectl rollout status deploy/$APP_NAME -n $APP_NS --timeout=180s
+EOF
+
+chmod +x scripts/*.sh
+
+############################################
+# JENKINSFILE
+############################################
+
+cat > jenkins/Jenkinsfile <<'EOF'
+pipeline {
+  agent any
+  options { timestamps() }
+
+  environment {
+    AWS_REGION = "ap-south-1"
+    ECR_REPO = "demo-app"
+    APP_NAME = "app"
+    APP_NS   = "default"
+    SLACK_WEBHOOK_URL = ""
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Terraform Apply') {
+      steps {
+        sh '''
+          cd terraform
+          terraform init -input=false
+          terraform apply -auto-approve -input=false -var-file=env/dev/dev.tfvars
+        '''
+      }
+    }
+
+    stage('ECR Login') {
+      steps { sh 'scripts/ecr-login.sh' }
+    }
+
+    stage('Build & Push Image') {
+      steps {
+        script {
+          def sha = sh(script:"git rev-parse --short HEAD", returnStdout:true).trim()
+          def tag = "${sha}-${BUILD_NUMBER}"
+
+          sh """
+            ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
+            REGISTRY="\${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+            IMAGE="\${REGISTRY}/${ECR_REPO}:${tag}"
+            docker build -t "\${IMAGE}" ./app
+            docker push "\${IMAGE}"
+            echo "\${IMAGE}" > image.txt
+          """
+        }
+      }
+    }
+
+    stage('Deploy via Helm') {
+      steps {
+        sh '''
+          IMAGE=$(cat image.txt)
+          REPO=$(echo "$IMAGE" | cut -d: -f1)
+          TAG=$(echo "$IMAGE" | cut -d: -f2)
+
+          CLUSTER_NAME=$(terraform -chdir=terraform output -raw cluster_name)
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region ${AWS_REGION}
+
+          sed "s#CHANGEME_ECR_URL/demo-app#${REPO%/*}/demo-app#g" helm/app-chart/values.yaml \
+            > helm/app-chart/generated.values.yaml
+
+          sed -i "s/tag:.*/tag: \\"$TAG\\"/g" helm/app-chart/generated.values.yaml
+
+          helm upgrade --install $APP_NAME helm/app-chart -n $APP_NS \
+            -f helm/app-chart/generated.values.yaml --atomic --wait
+        '''
+      }
+    }
+
+    stage('Validate') {
+      steps { sh 'scripts/validate.sh' }
+    }
+  }
+
+  post {
+    success {
+      sh '''
+      if [ -n "${SLACK_WEBHOOK_URL}" ]; then
+        curl -X POST -H "Content-type: application/json" \
+          --data "{\\"text\\":\\"✅ Success: ${JOB_NAME} #${BUILD_NUMBER}\\"}" \
+          "${SLACK_WEBHOOK_URL}"
+      fi
+      '''
+    }
+
+    failure {
+      sh '''
+      scripts/rollback.sh || true
+      if [ -n "${SLACK_WEBHOOK_URL}" ]; then
+        curl -X POST -H "Content-type: application/json" \
+          --data "{\\"text\\":\\"❌ Failure: ${JOB_NAME} #${BUILD_NUMBER}\\"}" \
+          "${SLACK_WEBHOOK_URL}"
+      fi
+      '''
+    }
+  }
+}
+EOF
+
+############################################
+# FINAL MESSAGE
+############################################
+echo ""
+echo "✅ Project created successfully!"
+echo "📁 Path: $(pwd)"
+echo ""
+echo "Next steps:"
+echo "  cd terraform"
+echo "  terraform init"
+echo "  terraform apply -auto-approve -var-file=env/dev/dev.tfvars"
