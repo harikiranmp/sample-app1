@@ -549,3 +549,173 @@ echo "Next steps:"
 echo "  cd terraform"
 echo "  terraform init"
 echo "  terraform apply -auto-approve -var-file=env/dev/dev.tfvars"
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="helm/jenkins"
+
+echo "Creating Jenkins Helm chart at: $ROOT"
+
+mkdir -p $ROOT/templates
+
+############################################
+# Chart.yaml
+############################################
+cat > $ROOT/Chart.yaml << 'EOF'
+apiVersion: v2
+name: jenkins
+description: Jenkins controller on EKS
+type: application
+version: 0.1.0
+appVersion: "2.440"
+EOF
+
+############################################
+# values.yaml
+############################################
+cat > $ROOT/values.yaml << 'EOF'
+controller:
+  image: "jenkins/jenkins:lts-jdk17"
+  replicaCount: 1
+  serviceType: LoadBalancer
+  servicePort: 8080
+  resources:
+    requests:
+      cpu: "300m"
+      memory: "1Gi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+
+storage:
+  size: 20Gi
+  storageClass: gp2
+
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: jenkins-sa
+EOF
+
+############################################
+# ServiceAccount
+############################################
+cat > $ROOT/templates/sa.yaml << 'EOF'
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.serviceAccount.name }}
+{{- end }}
+EOF
+
+############################################
+# RBAC
+############################################
+cat > $ROOT/templates/rbac.yaml << 'EOF'
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jenkins-clusterrole
+rules:
+- apiGroups: [""]
+  resources: ["pods","pods/exec","pods/log","services","endpoints","configmaps","secrets"]
+  verbs: ["create","delete","get","list","patch","update","watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments","replicasets","statefulsets"]
+  verbs: ["*"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jenkins-rolebinding
+subjects:
+- kind: ServiceAccount
+  name: {{ .Values.serviceAccount.name }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: jenkins-clusterrole
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+EOF
+
+############################################
+# PVC
+############################################
+cat > $ROOT/templates/pvc.yaml << 'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jenkins-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ .Values.storage.storageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.size }}
+EOF
+
+############################################
+# Deployment
+############################################
+cat > $ROOT/templates/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jenkins
+spec:
+  replicas: {{ .Values.controller.replicaCount }}
+  selector:
+    matchLabels:
+      app: jenkins
+  template:
+    metadata:
+      labels:
+        app: jenkins
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      containers:
+      - name: jenkins
+        image: {{ .Values.controller.image }}
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: {{ .Values.controller.servicePort }}
+        volumeMounts:
+        - name: jenkins-data
+          mountPath: /var/jenkins_home
+        resources:
+{{ toYaml .Values.controller.resources | indent 10 }}
+      volumes:
+      - name: jenkins-data
+        persistentVolumeClaim:
+          claimName: jenkins-pvc
+EOF
+
+############################################
+# Service
+############################################
+cat > $ROOT/templates/service.yaml << 'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins
+spec:
+  type: {{ .Values.controller.serviceType }}
+  selector:
+    app: jenkins
+  ports:
+  - port: 8080
+    targetPort: {{ .Values.controller.servicePort }}
+EOF
+
+echo "✅ Jenkins Helm chart created successfully!"
+echo "Run:"
+echo "  helm upgrade --install jenkins helm/jenkins -n jenkins --create-namespace"
+
