@@ -1,0 +1,174 @@
+import boto3
+import datetime as dt
+
+cw = boto3.client("cloudwatch")
+ec2 = boto3.client("ec2")
+co = boto3.client("compute-optimizer")
+
+
+# ---------------------------------------------
+# Helper: check if a resource has AutoOptimize=true
+# ---------------------------------------------
+def has_auto_optimize_tag(tags):
+    if not tags:
+        return False
+    for tag in tags:
+        if tag["Key"].lower() == "autooptimize" and tag["Value"].lower() == "true":
+            return True
+    return False
+
+
+# ---------------------------------------------
+# Helper: fetch avg metric from CloudWatch
+# ---------------------------------------------
+def get_metric_avg(instance_id, metric_name, hours=24):
+    end = dt.datetime.utcnow()
+    start = end - dt.timedelta(hours=hours)
+
+    resp = cw.get_metric_data(
+        MetricDataQueries=[
+            {
+                "Id": "m1",
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": "AWS/EC2",
+                        "MetricName": metric_name,
+                        "Dimensions": [
+                            {"Name": "InstanceId", "Value": instance_id}
+                        ],
+                    },
+                    "Period": 300,
+                    "Stat": "Average",
+                },
+            }
+        ],
+        StartTime=start,
+        EndTime=end,
+        ScanBy="TimestampDescending",
+    )
+
+    values = resp["MetricDataResults"][0].get("Values", [])
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+
+def lambda_handler(event, context):
+
+    idle_instances = []
+    idle_volumes = []
+
+    # ---------------------------------------------
+    # Step 1: Find EC2 instances that are tagged
+    # ---------------------------------------------
+    reservations = ec2.describe_instances(
+        Filters=[{"Name": "instance-state-name", "Values": ["running"]}]
+    )["Reservations"]
+
+    for res in reservations:
+        for inst in res["Instances"]:
+
+            instance_id = inst["InstanceId"]
+
+            # Skip if the tag is missing
+            if not has_auto_optimize_tag(inst.get("Tags", [])):
+                continue
+
+            # ---------------------------------------------
+            # Step 2: CloudWatch metrics
+            # ---------------------------------------------
+            cpu = get_metric_avg(instance_id, "CPUUtilization")
+            net_in = get_metric_avg(instance_id, "NetworkIn")
+            net_out = get_metric_avg(instance_id, "NetworkOut")
+            network = net_in + net_out
+
+            cw_idle = (cpu < 5 and network < 1024)
+
+            # ---------------------------------------------
+            # Step 3: Compute Optimizer
+            # ---------------------------------------------
+            co_idle = False
+            try:
+                reco = co.get_ec2_instance_recommendations(instanceArns=[instance_id])
+                if reco["instanceRecommendations"]:
+                    finding = reco["instanceRecommendations"][0]["finding"]
+                    if finding in ["Idle", "Overprovisioned"]:
+                        co_idle = True
+            except:
+                pass  # CO may not have enough data yet
+
+            # ---------------------------------------------
+            # Step 4: Combine CW + CO + Tag
+            # ---------------------------------------------
+            if cw_idle and co_idle:
+                idle_instances.append(instance_id)
+
+    # ---------------------------------------------
+    # Step 5: Check EBS volumes (tag required)
+    # ---------------------------------------------
+    volumes = ec2.describe_volumes()["Volumes"]
+
+    for v in volumes:
+        vol_id = v["VolumeId"]
+
+        # Skip if not tagged
+        if not has_auto_optimize_tag(v.get("Tags", [])):
+            continue
+
+        # Unattached volumes only
+        if v["State"] == "available":
+            idle_volumes.append(vol_id)
+
+    return {
+        "idle_instances": idle_instances,
+        "idle_volumes": idle_volumes
+    }
+
+
+import boto3
+
+ec2 = boto3.client("ec2")
+
+def lambda_handler(event, context):
+    """
+    event = {
+        "action": "stop-ec2" | "start-ec2" | "delete-volume",
+        "target": "resource-id"
+    }
+    """
+    if not isinstance(event, dict):
+        return {"error": "Event must be a JSON object"}
+
+    action = event.get("action")
+    target = event.get("target")
+
+    if not action or not target:
+        return {"error": "Missing 'action' or 'target' in event"}
+
+    # EC2 STOP
+    if action == "stop-ec2":
+        try:
+            ec2.stop_instances(InstanceIds=[target])
+            return {"status": f"Stop requested for instance {target}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    # EC2 START
+    elif action == "start-ec2":
+        try:
+            ec2.start_instances(InstanceIds=[target])
+            return {"status": f"Start requested for instance {target}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    # EBS DELETE
+    elif action == "delete-volume":
+        try:
+            ec2.delete_volume(VolumeId=target)
+            return {"status": f"Delete requested for volume {target}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    else:
+        return {"error": f"Unknown action '{action}'"}
