@@ -1,50 +1,44 @@
 import boto3
 import datetime as dt
 
-cw = boto3.client("cloudwatch")
 ec2 = boto3.client("ec2")
-co = boto3.client("compute-optimizer")
+cw  = boto3.client("cloudwatch")
+co  = boto3.client("compute-optimizer")
+sts = boto3.client("sts")
 
+TAG_KEY   = "AutoOptimize"
+TAG_VALUE = "Yes"
+CPU_THRESHOLD = 5.0  # percent
+LOOKBACK_HOURS = 24
 
-# ---------------------------------------------
-# Helper: check if a resource has AutoOptimize=true
-# ---------------------------------------------
-def has_auto_optimize_tag(tags):
-    if not tags:
-        return False
-    for tag in tags:
-        if tag["Key"].lower() == "autooptimize" and tag["Value"].lower() == "true":
+def has_required_tag(tags):
+    for t in tags or []:
+        if t["Key"] == TAG_KEY and t["Value"] == TAG_VALUE:
             return True
     return False
 
-
-# ---------------------------------------------
-# Helper: fetch avg metric from CloudWatch
-# ---------------------------------------------
-def get_metric_avg(instance_id, metric_name, hours=24):
+def avg_cpu_last_24h(instance_id):
     end = dt.datetime.utcnow()
-    start = end - dt.timedelta(hours=hours)
+    start = end - dt.timedelta(hours=LOOKBACK_HOURS)
+
+    query = [{
+        "Id": "cpu",
+        "MetricStat": {
+            "Metric": {
+                "Namespace": "AWS/EC2",
+                "MetricName": "CPUUtilization",
+                "Dimensions": [{"Name": "InstanceId", "Value": instance_id}]
+            },
+            "Period": 300,
+            "Stat": "Average"
+        }
+    }]
 
     resp = cw.get_metric_data(
-        MetricDataQueries=[
-            {
-                "Id": "m1",
-                "MetricStat": {
-                    "Metric": {
-                        "Namespace": "AWS/EC2",
-                        "MetricName": metric_name,
-                        "Dimensions": [
-                            {"Name": "InstanceId", "Value": instance_id}
-                        ],
-                    },
-                    "Period": 300,
-                    "Stat": "Average",
-                },
-            }
-        ],
+        MetricDataQueries=query,
         StartTime=start,
         EndTime=end,
-        ScanBy="TimestampDescending",
+        ScanBy="TimestampDescending"
     )
 
     values = resp["MetricDataResults"][0].get("Values", [])
@@ -52,123 +46,242 @@ def get_metric_avg(instance_id, metric_name, hours=24):
         return 0.0
     return sum(values) / len(values)
 
+def get_instance_arn(instance_id):
+    account_id = sts.get_caller_identity()["Account"]
+    region = boto3.session.Session().region_name
+    return f"arn:aws:ec2:{region}:{account_id}:instance/{instance_id}"
 
+def co_says_underutilized(instance_id):
+    """Returns True if CO finding is Idle or Overprovisioned."""
+    arn = get_instance_arn(instance_id)
 
-def lambda_handler(event, context):
+    try:
+        reco = co.get_ec2_instance_recommendations(instanceArns=[arn])
+        items = reco.get("instanceRecommendations", [])
+        if not items:
+            return False
+        finding = items[0].get("finding", "")
+        return finding in ["Idle", "Overprovisioned"]
+    except:
+        return False
 
+def evaluate_idle_resources():
     idle_instances = []
-    idle_volumes = []
+    unattached_volumes = []
 
-    # ---------------------------------------------
-    # Step 1: Find EC2 instances that are tagged
-    # ---------------------------------------------
+    # ---------------------------------------------------------
+    # 1. Analyze EC2 instances with required tags only
+    # ---------------------------------------------------------
     reservations = ec2.describe_instances(
-        Filters=[{"Name": "instance-state-name", "Values": ["running"]}]
+        Filters=[{"Name": f"tag:{TAG_KEY}", "Values": [TAG_VALUE]}]
     )["Reservations"]
 
-    for res in reservations:
-        for inst in res["Instances"]:
+    for r in reservations:
+        for inst in r["Instances"]:
+            if inst["State"]["Name"] != "running":
+                continue
 
             instance_id = inst["InstanceId"]
 
-            # Skip if the tag is missing
-            if not has_auto_optimize_tag(inst.get("Tags", [])):
-                continue
+            cpu_avg = avg_cpu_last_24h(instance_id)
+            co_ok   = co_says_underutilized(instance_id)
 
-            # ---------------------------------------------
-            # Step 2: CloudWatch metrics
-            # ---------------------------------------------
-            cpu = get_metric_avg(instance_id, "CPUUtilization")
-            net_in = get_metric_avg(instance_id, "NetworkIn")
-            net_out = get_metric_avg(instance_id, "NetworkOut")
-            network = net_in + net_out
-
-            cw_idle = (cpu < 5 and network < 1024)
-
-            # ---------------------------------------------
-            # Step 3: Compute Optimizer
-            # ---------------------------------------------
-            co_idle = False
-            try:
-                reco = co.get_ec2_instance_recommendations(instanceArns=[instance_id])
-                if reco["instanceRecommendations"]:
-                    finding = reco["instanceRecommendations"][0]["finding"]
-                    if finding in ["Idle", "Overprovisioned"]:
-                        co_idle = True
-            except:
-                pass  # CO may not have enough data yet
-
-            # ---------------------------------------------
-            # Step 4: Combine CW + CO + Tag
-            # ---------------------------------------------
-            if cw_idle and co_idle:
+            if cpu_avg < CPU_THRESHOLD and co_ok:
                 idle_instances.append(instance_id)
 
-    # ---------------------------------------------
-    # Step 5: Check EBS volumes (tag required)
-    # ---------------------------------------------
-    volumes = ec2.describe_volumes()["Volumes"]
+    # ---------------------------------------------------------
+    # 2. Unattached EBS volumes with tag only
+    # ---------------------------------------------------------
+    volumes = ec2.describe_volumes(
+        Filters=[{"Name": f"tag:{TAG_KEY}", "Values": [TAG_VALUE]}]
+    )["Volumes"]
 
     for v in volumes:
-        vol_id = v["VolumeId"]
-
-        # Skip if not tagged
-        if not has_auto_optimize_tag(v.get("Tags", [])):
-            continue
-
-        # Unattached volumes only
         if v["State"] == "available":
-            idle_volumes.append(vol_id)
+            unattached_volumes.append(v["VolumeId"])
 
+    # Final 2-list output
     return {
         "idle_instances": idle_instances,
-        "idle_volumes": idle_volumes
+        "unattached_volumes": unattached_volumes
     }
 
 
+if __name__ == "__main__":
+    print(evaluate_idle_resources())
+
+
+
+
+
+# lambda_function.py
+import os, json, time, datetime as dt
 import boto3
+from botocore.exceptions import ClientError
 
 ec2 = boto3.client("ec2")
+cw  = boto3.client("cloudwatch")
+co  = boto3.client("compute-optimizer")
+
+# ---- Config via environment variables ----
+TAG_KEY           = os.getenv("REQUIRED_TAG_KEY", "AutoOptimize")
+TAG_VALUE         = os.getenv("REQUIRED_TAG_VALUE", "Yes")
+REQUIRE_CO        = os.getenv("REQUIRE_COMPUTE_OPTIMIZER", "false").lower() == "true"
+CPU_THRESHOLD     = float(os.getenv("CPU_24H_AVG_THRESHOLD", "5"))    # %
+LOOKBACK_HOURS    = int(os.getenv("CPU_LOOKBACK_HOURS", "24"))
+DRYRUN_DEFAULT    = os.getenv("DEFAULT_DRYRUN", "true").lower() == "true"
+
+def _has_required_tag(tags):
+    if not tags: 
+        return False
+    for t in tags:
+        if t.get("Key") == TAG_KEY and t.get("Value") == TAG_VALUE:
+            return True
+    return False
+
+def _avg_cpu_24h(instance_id):
+    end   = dt.datetime.utcnow()
+    start = end - dt.timedelta(hours=LOOKBACK_HOURS)
+    q = [{
+        "Id": "cpu",
+        "MetricStat": {
+            "Metric": {
+                "Namespace": "AWS/EC2",
+                "MetricName": "CPUUtilization",
+                "Dimensions": [{"Name": "InstanceId", "Value": instance_id}]
+            },
+            "Period": 300,
+            "Stat": "Average"
+        }
+    }]
+    resp = cw.get_metric_data(MetricDataQueries=q, StartTime=start, EndTime=end, ScanBy="TimestampDescending")
+    vals = resp["MetricDataResults"][0].get("Values", [])
+    return sum(vals)/len(vals) if vals else 0.0
+
+def _co_underutilized(instance_arn):
+    # Compute Optimizer needs enrollment and a bit of data time.
+    try:
+        recos = co.get_ec2_instance_recommendations(instanceArns=[instance_arn]).get("instanceRecommendations", [])
+        if not recos:
+            return False
+        finding = recos[0].get("finding", "")  # e.g., "Underprovisioned" | "Overprovisioned" | "Optimized" | "NotOptimized"
+        # Treat Overprovisioned / NotOptimized as a green light to downsize/stop
+        return finding in ("Overprovisioned", "NotOptimized")
+    except ClientError:
+        return False
+
+def _instance_arn(account_id, region, instance_id):
+    return f"arn:aws:ec2:{region}:{account_id}:instance/{instance_id}"
+
+def _get_account_id():
+    return boto3.client("sts").get_caller_identity()["Account"]
+
+def _region():
+    return boto3.session.Session().region_name
+
+def _ec2_tags(desc):
+    # desc is the instance description dict or volume dict
+    tags = desc.get("Tags") or []
+    # API can also return "TagSet" for volumes via different calls; normalize:
+    if not tags and "TagSet" in desc:
+        tags = desc["TagSet"]
+    return tags
+
+def handle_ec2(action, target_id, dryrun):
+    # Describe instance
+    res = ec2.describe_instances(InstanceIds=[target_id])
+    inst = res["Reservations"][0]["Instances"][0]
+    if not _has_required_tag(_ec2_tags(inst)):
+        return {"allowed": False, "reason": f"Missing required tag {TAG_KEY}={TAG_VALUE}"}
+
+    state = inst["State"]["Name"]  # running/stopped/…
+    if action == "stop-ec2":
+        if state != "running":
+            return {"allowed": False, "reason": f"Instance not in running state: {state}"}
+
+        # Optional CloudWatch CPU check
+        avg_cpu = _avg_cpu_24h(target_id)
+        if avg_cpu > CPU_THRESHOLD:
+            return {"allowed": False, "reason": f"CPU 24h avg {avg_cpu:.2f}% > threshold {CPU_THRESHOLD}%"}
+
+        # Optional Compute Optimizer check
+        if REQUIRE_CO:
+            arn = _instance_arn(_get_account_id(), _region(), target_id)
+            if not _co_underutilized(arn):
+                return {"allowed": False, "reason": "Compute Optimizer does not indicate overprovisioned/not-optimized"}
+
+        if dryrun:
+            return {"allowed": True, "dryRun": True, "action": "ec2:StopInstances"}
+
+        ec2.stop_instances(InstanceIds=[target_id])
+        return {"allowed": True, "result": "STOP_REQUESTED"}
+
+    elif action == "start-ec2":
+        if state != "stopped":
+            return {"allowed": False, "reason": f"Instance not in stopped state: {state}"}
+        if dryrun:
+            return {"allowed": True, "dryRun": True, "action": "ec2:StartInstances"}
+        ec2.start_instances(InstanceIds=[target_id])
+        return {"allowed": True, "result": "START_REQUESTED"}
+
+    else:
+        return {"allowed": False, "reason": f"Unsupported EC2 action: {action}"}
+
+def handle_ebs(action, volume_id, dryrun):
+    v = ec2.describe_volumes(VolumeIds=[volume_id])["Volumes"][0]
+    if not _has_required_tag(_ec2_tags(v)):
+        return {"allowed": False, "reason": f"Missing required tag {TAG_KEY}={TAG_VALUE}"}
+
+    if action != "delete-volume":
+        return {"allowed": False, "reason": f"Unsupported EBS action: {action}"}
+
+    # Must be unattached (state 'available')
+    if v["State"] != "available":
+        return {"allowed": False, "reason": f"Volume state is {v['State']}, not 'available' (unattached)"}
+
+    # gp3 has no BurstBalance; that’s fine—we predicate only on state+tag.
+    if dryrun:
+        return {"allowed": True, "dryRun": True, "action": "ec2:DeleteVolume"}
+    ec2.delete_volume(VolumeId=volume_id)
+    return {"allowed": True, "result": "DELETE_REQUESTED"}
 
 def lambda_handler(event, context):
     """
-    event = {
-        "action": "stop-ec2" | "start-ec2" | "delete-volume",
-        "target": "resource-id"
+    Event contract (from SSM Automation or Service Catalog custom resource):
+    {
+      "ActionType": "stop-ec2" | "start-ec2" | "delete-volume",
+      "TargetId": "i-xxxx | vol-xxxx",
+      "DryRun": true|false   (optional; defaults from env DEFAULT_DRYRUN)
     }
     """
-    if not isinstance(event, dict):
-        return {"error": "Event must be a JSON object"}
+    # Accept both SC custom resource and direct invoke shapes
+    if isinstance(event, str):
+        try: event = json.loads(event)
+        except: event = {}
 
-    action = event.get("action")
-    target = event.get("target")
+    # Service Catalog custom resource may wrap payload differently; unwrap if needed
+    if "ResourceProperties" in event:
+        payload = event["ResourceProperties"]
+    else:
+        payload = event
+
+    action = payload.get("ActionType")
+    target = payload.get("TargetId")
+    dryrun = payload.get("DryRun")
+    if dryrun is None:
+        dryrun = DRYRUN_DEFAULT
 
     if not action or not target:
-        return {"error": "Missing 'action' or 'target' in event"}
+        return {"ok": False, "error": "ActionType and TargetId are required"}
 
-    # EC2 STOP
-    if action == "stop-ec2":
-        try:
-            ec2.stop_instances(InstanceIds=[target])
-            return {"status": f"Stop requested for instance {target}"}
-        except Exception as e:
-            return {"error": str(e)}
+    try:
+        if action in ("stop-ec2", "start-ec2"):
+            result = handle_ec2(action, target, dryrun)
+        elif action in ("delete-volume",):
+            result = handle_ebs(action, target, dryrun)
+        else:
+            result = {"allowed": False, "reason": f"Unknown action {action}"}
 
-    # EC2 START
-    elif action == "start-ec2":
-        try:
-            ec2.start_instances(InstanceIds=[target])
-            return {"status": f"Start requested for instance {target}"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    # EBS DELETE
-    elif action == "delete-volume":
-        try:
-            ec2.delete_volume(VolumeId=target)
-            return {"status": f"Delete requested for volume {target}"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    else:
-        return {"error": f"Unknown action '{action}'"}
+        return {"ok": True, "action": action, "target": target, **result}
+    except ClientError as e:
+        return {"ok": False, "error": str(e), "action": action, "target": target}
