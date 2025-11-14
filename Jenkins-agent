@@ -1,0 +1,192 @@
+jenkins-chart/
+  Chart.yaml
+  values.yaml
+  templates/
+    namespace.yaml
+    serviceaccount.yaml
+    rbac.yaml
+    deployment.yaml
+    service.yaml
+    agent-podtemplate.yaml
+
+apiVersion: v2
+name: jenkins-chart
+description: Fully configured Jenkins with Kaniko & Kubernetes agents for EKS
+type: application
+version: 1.0.0
+appVersion: "lts"
+
+image:
+  repository: jenkins/jenkins
+  tag: lts-jdk17
+  pullPolicy: IfNotPresent
+
+service:
+  type: LoadBalancer
+  port: 8080
+  agentListenerPort: 50000
+
+adminUser: admin
+adminPassword: admin
+
+serviceAccount:
+  name: jenkins-sa
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::<ACCOUNT_ID>:role/<EKS_JENKINS_ROLE>"
+
+resources: {}
+
+kaniko:
+  image: gcr.io/kaniko-project/executor:latest
+
+agent:
+  image: ghcr.io/jenkinsci/jnlp-agent:latest
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jenkins
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.serviceAccount.name }}
+  namespace: jenkins
+  annotations:
+{{- range $k, $v := .Values.serviceAccount.annotations }}
+    {{ $k }}: "{{ $v }}"
+{{- end }}
+
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jenkins-clusterrole
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "secrets", "services"]
+    verbs: ["get", "watch", "create", "delete", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jenkins-crb
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: jenkins
+roleRef:
+  kind: ClusterRole
+  name: jenkins-clusterrole
+  apiGroup: rbac.authorization.k8s.io
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jenkins
+  namespace: jenkins
+  labels: { app: jenkins }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: jenkins }
+  template:
+    metadata:
+      labels: { app: jenkins }
+      annotations:
+        jenkins.io/agent-pod-template: "enabled"
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+      containers:
+        - name: jenkins
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+            - containerPort: 50000
+          env:
+            - name: JENKINS_OPTS
+              value: "--prefix=/"
+            - name: JAVA_OPTS
+              value: "-Djenkins.install.runSetupWizard=false"
+            - name: JENKINS_ADMIN_ID
+              value: "{{ .Values.adminUser }}"
+            - name: JENKINS_ADMIN_PASSWORD
+              value: "{{ .Values.adminPassword }}"
+          readinessProbe:
+            httpGet: { path: /login, port: 8080 }
+            initialDelaySeconds: 20
+          livenessProbe:
+            httpGet: { path: /login, port: 8080 }
+            initialDelaySeconds: 60
+          volumeMounts:
+            - name: jenkins-home
+              mountPath: /var/jenkins_home
+      volumes:
+        - name: jenkins-home
+          emptyDir: {}
+
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins
+  namespace: jenkins
+  labels: { app: jenkins }
+spec:
+  type: {{ .Values.service.type }}
+  selector: { app: jenkins }
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: 8080
+    - name: agent
+      port: {{ .Values.service.agentListenerPort }}
+      targetPort: 50000
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jenkins-agent-templates
+  namespace: jenkins
+  labels:
+    jenkins.io/kubernetes: "true"
+data:
+  kaniko.yaml: |
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      labels:
+        jenkins: agent
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      containers:
+        - name: kaniko
+          image: {{ .Values.kaniko.image }}
+          args:
+            - "--verbosity=info"
+            - "--skip-tls-verify=true"
+          volumeMounts:
+            - name: kaniko-storage
+              mountPath: /workspace
+        - name: tools
+          image: alpine/helm:3.14.0
+          command: ["cat"]
+          tty: true
+          volumeMounts:
+            - name: kaniko-storage
+              mountPath: /workspace
+      restartPolicy: Never
+      volumes:
+        - name: kaniko-storage
+          emptyDir: {}
+
+
