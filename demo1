@@ -719,3 +719,114 @@ echo "✅ Jenkins Helm chart created successfully!"
 echo "Run:"
 echo "  helm upgrade --install jenkins helm/jenkins -n jenkins --create-namespace"
 
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jenkins
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins
+  namespace: jenkins
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jenkins-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: jenkins
+    namespace: jenkins
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jenkins
+  namespace: jenkins
+  labels:
+    app: jenkins
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jenkins
+  template:
+    metadata:
+      labels:
+        app: jenkins
+    spec:
+      serviceAccountName: jenkins
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+      volumes:
+        - name: jenkins-home
+          emptyDir: {}
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+      containers:
+        - name: jenkins
+          image: jenkins/jenkins:lts-jdk17
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+            - containerPort: 50000
+          volumeMounts:
+            - name: jenkins-home
+              mountPath: /var/jenkins_home
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+          env:
+            - name: JAVA_OPTS
+              value: "-Djenkins.install.runSetupWizard=false"
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /login
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          # Install Helm + kubectl at startup
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  [
+                    "bash",
+                    "-c",
+                    "curl -LO https://get.helm.sh/helm-v3.14.0-linux-amd64.tar.gz && \
+                     tar -zxvf helm-v3.14.0-linux-amd64.tar.gz && \
+                     mv linux-amd64/helm /usr/local/bin/helm && \
+                     curl -LO https://amazon-eks.s3.amazonaws.com/1.30.0/2024-02-14/bin/linux/amd64/kubectl && \
+                     chmod +x kubectl && mv kubectl /usr/local/bin/kubectl"
+                  ]
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins
+  namespace: jenkins
+  labels:
+    app: jenkins
+spec:
+  type: LoadBalancer
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: agent
+      port: 50000
+      targetPort: 50000
+  selector:
+    app: jenkins
